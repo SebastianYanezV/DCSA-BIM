@@ -3,3 +3,5 @@ experimentos.py
 Redes/
 Otros/
 env/
+Cache/
+__pycache__/

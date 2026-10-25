@@ -4,11 +4,14 @@ import random
 import numpy as np
 import pandas as pd
 import time
-from typing import List
+import os
+import pickle
+from bisect import bisect_right
+from typing import List, Optional
 
 class DCSA_BIM:
-    def __init__(self, G: nx.Graph, n: int, B: float, alpha: float, beta: float, g_max: int, fl: float, AP: float, 
-                 costs: dict, efficiencies: dict, constraint_dict: dict, p: float = 0.01):
+    def __init__(self, G: nx.Graph, n: int, B: float, alpha: float, beta: float, g_max: int, fl: float, AP: float,
+                 costs: dict, efficiencies: dict, constraint_dict: dict, p: float = 0.01, core_dict: Optional[dict] = None):
         """
         Inicializa los parámetros del DCSA recibiendo las métricas ya precalculadas
         """
@@ -27,12 +30,36 @@ class DCSA_BIM:
         self.costs = costs
         self.efficiencies = efficiencies
         self._constraint = constraint_dict
-        
+        self._core = core_dict
+
+        # Listas de adyacencia y grados precalculados (más rápido que consultar networkx)
+        self.adj = {v: list(G.neighbors(v)) for v in self.nodes}
+        self.deg = {v: len(self.adj[v]) for v in self.nodes}
+
+        # Nodos ordenados por costo, para elegir rápidamente nodos que caben en un saldo
+        self.nodes_by_cost = sorted(self.nodes, key=lambda v: self.costs[v])
+        self.sorted_costs = [self.costs[v] for v in self.nodes_by_cost]
+        self.min_cost = self.sorted_costs[0]
+
+        self.candidates = [] # Se generan al inicio de optimize()
         self.lie_cache = {} # Memoria caché para no recalcular LIE
 
     def _get_cost(self, S: List[int]) -> float:
         """Calcula el costo total de un conjunto semilla"""
         return sum(self.costs[n] for n in S)
+
+    def _random_node_within(self, limit: float, exclude) -> Optional[int]:
+        """Retorna un nodo aleatorio con costo <= limit que no esté en exclude (None si no existe)"""
+        idx = bisect_right(self.sorted_costs, limit)
+        if idx == 0:
+            return None
+        # Muestreo con reintentos (rápido); si falla, se filtra explícitamente
+        for _ in range(30):
+            node = self.nodes_by_cost[random.randrange(idx)]
+            if node not in exclude:
+                return node
+        valid = [v for v in self.nodes_by_cost[:idx] if v not in exclude]
+        return random.choice(valid) if valid else None
 
     def calculate_LIE(self, S: List[int]) -> float:
         """Estimación de Influencia Local (LIE) de 2 saltos con Caché"""
@@ -40,48 +67,46 @@ class DCSA_BIM:
             return 0.0
 
         # Convertir la lista a un frozenset (inmutable) para usarlo como llave
-        s_key = frozenset(S)
-        if s_key in self.lie_cache:
-            return self.lie_cache[s_key] # Si ya se calculó antes, retornar el valor al instante
+        S_set = frozenset(S)
+        if S_set in self.lie_cache:
+            return self.lie_cache[S_set] # Si ya se calculó antes, retornar el valor al instante
 
-        S_set = set(S)
-        N1_S = set()
-        for u in S:
-            N1_S.update(self.G.neighbors(u))
-        N1_S = N1_S - S_set
+        # N1_S con la cantidad de vecinos en S de cada nodo (recorriendo S en vez de N1_S)
+        neighbors_in_S = {}
+        for u in S_set:
+            for v in self.adj[u]:
+                if v not in S_set:
+                    neighbors_in_S[v] = neighbors_in_S.get(v, 0) + 1
 
-        N2_S = set()
-        for u in N1_S:
-            N2_S.update(self.G.neighbors(u))
-        N2_S = N2_S - S_set - N1_S
+        lie_value = float(len(S_set))
 
-        lie_value = float(len(S))
+        if neighbors_in_S:
+            q = 1 - self.p
+            inf_1 = sum(1 - q ** c for c in neighbors_in_S.values())
 
-        inf_1 = 0.0
-        for v in N1_S:
-            neighbors_in_S = sum(1 for u in self.G.neighbors(v) if u in S_set)
-            inf_1 += (1 - (1 - self.p) ** neighbors_in_S)
+            N2_S = set()
+            for v in neighbors_in_S:
+                N2_S.update(self.adj[v])
+            N2_S.difference_update(S_set)
+            N2_S.difference_update(neighbors_in_S.keys())
 
-        lie_value += inf_1
+            # d*_u: número de aristas del nodo u dentro de N1_S y N2_S
+            sum_d = 0
+            for u in N2_S:
+                for w in self.adj[u]:
+                    if w in neighbors_in_S or w in N2_S:
+                        sum_d += 1
 
-        if len(N1_S) > 0:
-            sum_p_d = sum(self.p * self.G.degree(u) for u in N2_S)
-            lie_value += (inf_1 / len(N1_S)) * sum_p_d
+            lie_value += inf_1 + (inf_1 / len(neighbors_in_S)) * self.p * sum_d
 
         # Guardar el resultado en el caché antes de retornar
-        self.lie_cache[s_key] = lie_value
+        self.lie_cache[S_set] = lie_value
         return lie_value
 
     def generate_candidates(self, alpha_metric: float = 0.5, beta_cand: float = 3.0) -> List[int]:
         """Genera candidatos usando K-shell y Structural Holes"""
-        k_shell = nx.core_number(self.G)
+        k_shell = self._core if self._core is not None else nx.core_number(self.G)
         sum_ks = sum(k_shell.values())
-        """
-        try:
-            struct_holes = nx.constraint(self.G)
-        except:
-            struct_holes = {node: 1.0/self.G.degree(node) if self.G.degree(node)>0 else 1.0 for node in self.nodes}
-        """
         struct_holes = self._constraint
         sum_sh_inv = sum(1.0 / v if v > 0 else 0 for v in struct_holes.values())
 
@@ -102,23 +127,28 @@ class DCSA_BIM:
 
     def repair_solution(self, S: List[int]) -> List[int]:
         """
-        Verifica el presupuesto B. Si excede, elimina secuencialmente
-        los nodos de menor eficiencia e(v) hasta cumplir la restricción
+        Reparación en dos fases:
+        1) Si excede B, elimina secuencialmente los nodos de menor eficiencia e(v) hasta cumplir la restricción
+        2) Si el saldo restante lo permite, rellena con candidatos aleatorios cuyo costo no exceda el saldo
         """
         S_set = set(S)
+        current_cost = self._get_cost(S_set)
 
-        while self._get_cost(list(S_set)) > self.B:
-            # Seleccionar el nodo con la peor eficiencia
+        # Fase 1: eliminar nodos de peor eficiencia
+        while current_cost > self.B:
             worst_node = min(S_set, key=lambda node: self.efficiencies[node])
             S_set.remove(worst_node)
+            current_cost -= self.costs[worst_node]
 
-            # Intentar rellenar con un nodo aleatorio que encaje en el saldo
-            remaining_budget = self.B - self._get_cost(list(S_set))
-            if remaining_budget >= 1.0:
-                valid_candidates = [n for n in self.nodes if n not in S_set and self.costs[n] <= remaining_budget]
-                if valid_candidates:
-                    new_node = random.choice(valid_candidates)
-                    S_set.add(new_node)
+        # Fase 2: rellenar con candidatos mientras quepan en el saldo
+        remaining_budget = self.B - current_cost
+        while remaining_budget >= self.min_cost:
+            valid_candidates = [c for c in self.candidates if c not in S_set and self.costs[c] <= remaining_budget]
+            if not valid_candidates:
+                break
+            new_node = random.choice(valid_candidates)
+            S_set.add(new_node)
+            remaining_budget -= self.costs[new_node]
 
         return list(S_set)
 
@@ -127,28 +157,34 @@ class DCSA_BIM:
         sorted_by_eff = sorted(self.nodes, key=lambda x: self.efficiencies[x], reverse=True)
 
         base_S = []
-        current_cost = 0.0
+        base_cost = 0.0
         for node in sorted_by_eff:
-            if current_cost + self.costs[node] <= self.B:
+            if base_cost + self.costs[node] <= self.B:
                 base_S.append(node)
-                current_cost += self.costs[node]
+                base_cost += self.costs[node]
 
         X = []
         for i in range(self.n):
             xi = list(base_S)
+            xi_set = set(xi)
+            current_cost = base_cost
             for j in range(len(xi)):
                 if random.random() > 0.5:
                     node_to_remove = xi[j]
-                    cost_without = self._get_cost(xi) - self.costs[node_to_remove]
-                    valid_candidates = [n for n in self.nodes if n not in xi and cost_without + self.costs[n] <= self.B]
-                    if valid_candidates:
-                        xi[j] = random.choice(valid_candidates)
+                    cost_without = current_cost - self.costs[node_to_remove]
+                    new_node = self._random_node_within(self.B - cost_without, xi_set)
+                    if new_node is not None:
+                        xi[j] = new_node
+                        xi_set.remove(node_to_remove)
+                        xi_set.add(new_node)
+                        current_cost = cost_without + self.costs[new_node]
             X.append(xi)
         return X
 
     def update_position(self, x_i: List[int], m_j: List[int], r_i: float) -> List[int]:
         """Actualiza la posición y repara la solución"""
         x_new = list(x_i)
+        x_new_set = set(x_new)
         m_j_set = set(m_j)
 
         for j in range(len(x_new)):
@@ -159,7 +195,9 @@ class DCSA_BIM:
             if H == 1:
                 while True:
                     new_node = random.choice(self.nodes)
-                    if new_node not in x_new:
+                    if new_node not in x_new_set:
+                        x_new_set.remove(x_new[j])
+                        x_new_set.add(new_node)
                         x_new[j] = new_node
                         break
 
@@ -184,6 +222,7 @@ class DCSA_BIM:
         por los mejores vecinos posibles, respetando el presupuesto B
         """
         x_best = list(x_star)
+        x_best_set = set(x_best)
         current_lie = self.calculate_LIE(x_best)
         current_cost = self._get_cost(x_best)
 
@@ -191,7 +230,7 @@ class DCSA_BIM:
         sorted_x = sorted(x_best, key=lambda n: self.efficiencies[n])
 
         for node in sorted_x:
-            neighbors = list(self.G.neighbors(node))
+            neighbors = self.adj[node]
 
             # Búsqueda Local Truncada.
             # Si el nodo tiene demasiados vecinos, evalúa solo a los 15 más eficientes
@@ -199,7 +238,7 @@ class DCSA_BIM:
                 neighbors = sorted(neighbors, key=lambda n: self.efficiencies[n], reverse=True)[:15]
 
             for neighbor in neighbors:
-                if neighbor not in x_best:
+                if neighbor not in x_best_set:
                     cost_diff = self.costs[neighbor] - self.costs[node]
 
                     if current_cost + cost_diff <= self.B:
@@ -210,6 +249,8 @@ class DCSA_BIM:
                         new_lie = self.calculate_LIE(x_temp)
                         if new_lie > current_lie:
                             x_best = x_temp
+                            x_best_set.remove(node)
+                            x_best_set.add(neighbor)
                             current_lie = new_lie
                             current_cost += cost_diff
                             node = neighbor # Se actualiza para que las siguientes comparaciones sean contra el nuevo
@@ -217,14 +258,19 @@ class DCSA_BIM:
 
     def optimize(self):
         """Ejecuta el ciclo principal del DCSA."""
+        Candidates = self.generate_candidates()
+        self.candidates = Candidates
+
         X = self.initialization()
         M = [list(xi) for xi in X]
 
-        LIE_values = [self.calculate_LIE(xi) for xi in X]
-        best_idx = np.argmax(LIE_values)
-        x_star = list(X[best_idx])
+        # Fitness guardado junto a cada cuervo para no recalcularlo
+        fit_X = [self.calculate_LIE(xi) for xi in X]
+        fit_M = [self.calculate_LIE(mi) for mi in M]
 
-        Candidates = self.generate_candidates()
+        best_idx = int(np.argmax(fit_M))
+        x_star = list(M[best_idx])
+        fit_star = fit_M[best_idx]
 
         for iter_num in range(self.g_max):
             for i in range(self.n):
@@ -233,28 +279,35 @@ class DCSA_BIM:
                 r_j = random.random()
 
                 if r_j >= self.AP:
-                    x_new = self.update_position(X[i], M[j], r_i)
+                    # Seguimiento: la nueva posición se acepta siempre (la memoria guarda la mejor)
+                    X[i] = self.update_position(X[i], M[j], r_i)
+                    fit_X[i] = self.calculate_LIE(X[i])
                 else:
+                    # Caminata aleatoria: se acepta solo si mejora
                     x_new = self.random_walk(Candidates)
+                    fit_new = self.calculate_LIE(x_new)
+                    if fit_new > fit_X[i]:
+                        X[i] = x_new
+                        fit_X[i] = fit_new
 
-                if self.calculate_LIE(x_new) > self.calculate_LIE(X[i]):
-                    X[i] = list(x_new)
-
-                if self.calculate_LIE(X[i]) > self.calculate_LIE(M[i]):
+            # Actualizar la memoria de los cuervos
+            for i in range(self.n):
+                if fit_X[i] > fit_M[i]:
                     M[i] = list(X[i])
+                    fit_M[i] = fit_X[i]
 
-            LIE_values = [self.calculate_LIE(xi) for xi in X]
-            best_idx = np.argmax(LIE_values)
-            current_best = list(X[best_idx])
-
-            if self.calculate_LIE(current_best) > self.calculate_LIE(x_star):
-                x_star = current_best
+            best_idx = int(np.argmax(fit_M))
+            if fit_M[best_idx] > fit_star:
+                x_star = list(M[best_idx])
+                fit_star = fit_M[best_idx]
 
             x_star_prime = self.local_search(x_star)
-            if self.calculate_LIE(x_star_prime) > self.calculate_LIE(x_star):
+            fit_prime = self.calculate_LIE(x_star_prime)
+            if fit_prime > fit_star:
                 x_star = x_star_prime
+                fit_star = fit_prime
 
-            print(f"Iteración {iter_num + 1}/{self.g_max} | Mejor LIE: {self.calculate_LIE(x_star):.4f} | Nodos: {len(x_star)} | Costo: {self._get_cost(x_star):.2f}/{self.B:.2f}")
+            print(f"Iteración {iter_num + 1}/{self.g_max} | Mejor LIE: {fit_star:.4f} | Nodos: {len(x_star)} | Costo: {self._get_cost(x_star):.2f}/{self.B:.2f}")
 
         return x_star
 
@@ -279,30 +332,21 @@ def calcular_spread_monte_carlo(G, semillas, p=0.01, iteraciones=10000):
 
     return spread_total / iteraciones
 
-if __name__ == "__main__":
+def cargar_metricas(G, ruta_red, carpeta_cache="Cache"):
+    """
+    Calcula Constraint, Betweenness y K-shell de la red, o los carga desde disco
+    si ya fueron calculados antes para esta misma red
+    """
+    nombre = os.path.splitext(os.path.basename(ruta_red))[0]
+    ruta_cache = os.path.join(carpeta_cache, f"{nombre}_metricas.pkl")
 
-    N_RUNS = 10
-
-    # Cargar la red
-    formato = input("Formato archivo (txt/csv): ")
-    if formato == "txt":
-        print("Cargando la red desde txt...")
-        G = nx.read_edgelist("Redes/nombre_red.txt", comments='#', nodetype=int, create_using=nx.Graph())
-    else:
-        print("Cargando la red desde csv...")
-        df = pd.read_csv("Redes/nombre_red.csv")
-        G = nx.from_pandas_edgelist(df, source='nodo_1', target='nodo_2', create_using=nx.Graph())
-
-    largest_cc = max(nx.connected_components(G), key=len)
-    G = G.subgraph(largest_cc).copy()
-    G.remove_edges_from(nx.selfloop_edges(G))
-    print(f"Red cargada: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
-
-    # =====================================================================
-    # BLOQUE DE PRE-CÁLCULOS (SE EJECUTA UNA SOLA VEZ)
-    # =====================================================================
-    print("\nIniciando pre-cálculo de métricas estructurales de la red...")
-    start_precalc = time.time()
+    if os.path.exists(ruta_cache):
+        print(f"- Cargando métricas desde {ruta_cache}...")
+        with open(ruta_cache, "rb") as f:
+            metricas = pickle.load(f)
+        if metricas["n_nodos"] == G.number_of_nodes() and metricas["n_aristas"] == G.number_of_edges():
+            return metricas["constraint"], metricas["bc"], metricas["core"]
+        print("- La caché no coincide con la red cargada, se recalcula...")
 
     # 1. igraph y Constraint (Structural Holes)
     print("- Construyendo igraph y calculando Constraint...")
@@ -314,13 +358,53 @@ if __name__ == "__main__":
     print("- Calculando Betweenness Centrality...")
     bc_values = H.betweenness(directed=False, normalized=True, vertices=None, cutoff=-1)
     bc = dict(zip(H.vs["_nx_name"], bc_values))
+
+    # 3. K-shell
+    print("- Calculando K-shell...")
+    core = nx.core_number(G)
+
+    os.makedirs(carpeta_cache, exist_ok=True)
+    with open(ruta_cache, "wb") as f:
+        pickle.dump({"n_nodos": G.number_of_nodes(), "n_aristas": G.number_of_edges(),
+                     "constraint": constraint_dict, "bc": bc, "core": core}, f)
+
+    return constraint_dict, bc, core
+
+if __name__ == "__main__":
+
+    N_RUNS = 10
+
+    # Cargar la red
+    formato = input("Formato archivo (txt/csv): ")
+    if formato == "txt":
+        print("Cargando la red desde txt...")
+        ruta_red = "Redes/nombre_red.txt"
+        G = nx.read_edgelist(ruta_red, comments='#', nodetype=int, create_using=nx.Graph())
+    else:
+        print("Cargando la red desde csv...")
+        ruta_red = "Redes/nombre_red.csv"
+        df = pd.read_csv(ruta_red)
+        G = nx.from_pandas_edgelist(df, source='nodo_1', target='nodo_2', create_using=nx.Graph())
+
+    largest_cc = max(nx.connected_components(G), key=len)
+    G = G.subgraph(largest_cc).copy()
+    G.remove_edges_from(nx.selfloop_edges(G))
+    print(f"Red cargada: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
+
+    # =====================================================================
+    # BLOQUE DE PRE-CÁLCULOS (SE EJECUTA UNA SOLA VEZ, SE GUARDA EN DISCO)
+    # =====================================================================
+    print("\nIniciando pre-cálculo de métricas estructurales de la red...")
+    start_precalc = time.time()
+
+    constraint_dict, bc, core_dict = cargar_metricas(G, ruta_red)
     bc_min, bc_max = min(bc.values()), max(bc.values())
 
-    # 3. Grados, Costos y Eficiencias
+    # Grados, Costos y Eficiencias
     print("- Calculando Grados, Costos y Eficiencias...")
     degrees = dict(G.degree())
     deg_min, deg_max = min(degrees.values()), max(degrees.values())
-    
+
     alpha_costo = 0.5
     beta_eficiencia = 0.5
 
@@ -333,7 +417,7 @@ if __name__ == "__main__":
 
         c_v = 1.0 + alpha_costo * deg_norm
         e_v = (beta_eficiencia * deg_norm + (1.0 - beta_eficiencia) * bc_norm) / c_v
-        
+
         costs_dict[node] = c_v
         efficiencies_dict[node] = e_v
 
@@ -349,15 +433,20 @@ if __name__ == "__main__":
         print(f"RUN {run}/{N_RUNS}")
         print(f"{'='*50}")
 
+        # Semilla fija por run para que los resultados sean reproducibles
+        random.seed(run)
+        np.random.seed(run)
+
         # --- DCSA-BIM ---
         # Pasar diccionarios precalculados a la clase
         dcsa_bim = DCSA_BIM(
             G=G, n=20, B=50, alpha=alpha_costo, beta=beta_eficiencia, g_max=100, fl=1.5, AP=0.1,
-            costs=costs_dict, 
-            efficiencies=efficiencies_dict, 
-            constraint_dict=constraint_dict
+            costs=costs_dict,
+            efficiencies=efficiencies_dict,
+            constraint_dict=constraint_dict,
+            core_dict=core_dict
         )
-        
+
         start = time.time()
         semillas_bim = dcsa_bim.optimize()
         tiempo_bim = time.time() - start
@@ -365,7 +454,7 @@ if __name__ == "__main__":
         # Para el cálculo de B se usa el diccionario precargado
         B_bim = sum(costs_dict[n] for n in semillas_bim)
         LIE_bim = dcsa_bim.calculate_LIE(semillas_bim)
-        
+
         # Cálculo de Monte Carlo
         spread_bim = calcular_spread_monte_carlo(G, semillas_bim, p=0.01, iteraciones=10000)
 

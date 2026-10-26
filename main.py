@@ -34,7 +34,14 @@ class DCSA_BIM:
 
         # Listas de adyacencia y grados precalculados (más rápido que consultar networkx)
         self.adj = {v: list(G.neighbors(v)) for v in self.nodes}
-        self.deg = {v: len(self.adj[v]) for v in self.nodes}
+
+        # Red en formato CSR (arreglos numpy) para calcular LIE de forma vectorizada
+        self.idx = {v: i for i, v in enumerate(self.nodes)}
+        self.deg_arr = np.array([len(self.adj[v]) for v in self.nodes], dtype=np.int64)
+        self.indptr = np.zeros(len(self.nodes) + 1, dtype=np.int64)
+        self.indptr[1:] = np.cumsum(self.deg_arr)
+        self.indices = np.fromiter((self.idx[w] for v in self.nodes for w in self.adj[v]),
+                                   dtype=np.int64, count=int(self.indptr[-1]))
 
         # Nodos ordenados por costo, para elegir rápidamente nodos que caben en un saldo
         self.nodes_by_cost = sorted(self.nodes, key=lambda v: self.costs[v])
@@ -61,6 +68,14 @@ class DCSA_BIM:
         valid = [v for v in self.nodes_by_cost[:idx] if v not in exclude]
         return random.choice(valid) if valid else None
 
+    def _neighbors_of(self, rows: np.ndarray) -> np.ndarray:
+        """Retorna los vecinos (con repeticiones) de los nodos con índices rows, sin bucles de Python"""
+        lens = self.deg_arr[rows]
+        ends = np.cumsum(lens)
+        total = int(ends[-1]) if ends.size else 0
+        offsets = np.repeat(self.indptr[rows] - (ends - lens), lens)
+        return self.indices[offsets + np.arange(total)]
+
     def calculate_LIE(self, S: List[int]) -> float:
         """Estimación de Influencia Local (LIE) de 2 saltos con Caché"""
         if not S:
@@ -71,33 +86,33 @@ class DCSA_BIM:
         if S_set in self.lie_cache:
             return self.lie_cache[S_set] # Si ya se calculó antes, retornar el valor al instante
 
-        # N1_S con la cantidad de vecinos en S de cada nodo (recorriendo S en vez de N1_S)
-        neighbors_in_S = {}
-        for u in S_set:
-            for v in self.adj[u]:
-                if v not in S_set:
-                    neighbors_in_S[v] = neighbors_in_S.get(v, 0) + 1
+        N = len(self.nodes)
+        S_idx = np.fromiter((self.idx[v] for v in S_set), dtype=np.int64, count=len(S_set))
+
+        # N1_S con la cantidad de vecinos en S de cada nodo
+        neighbors_in_S = np.bincount(self._neighbors_of(S_idx), minlength=N)
+        neighbors_in_S[S_idx] = 0
+        N1_S = np.flatnonzero(neighbors_in_S)
 
         lie_value = float(len(S_set))
 
-        if neighbors_in_S:
-            q = 1 - self.p
-            inf_1 = sum(1 - q ** c for c in neighbors_in_S.values())
+        if N1_S.size:
+            inf_1 = float(np.sum(1 - (1 - self.p) ** neighbors_in_S[N1_S]))
 
-            N2_S = set()
-            for v in neighbors_in_S:
-                N2_S.update(self.adj[v])
-            N2_S.difference_update(S_set)
-            N2_S.difference_update(neighbors_in_S.keys())
+            in_N2 = np.zeros(N, dtype=bool)
+            in_N2[self._neighbors_of(N1_S)] = True
+            in_N2[S_idx] = False
+            in_N2[N1_S] = False
+            N2_S = np.flatnonzero(in_N2)
 
             # d*_u: número de aristas del nodo u dentro de N1_S y N2_S
             sum_d = 0
-            for u in N2_S:
-                for w in self.adj[u]:
-                    if w in neighbors_in_S or w in N2_S:
-                        sum_d += 1
+            if N2_S.size:
+                in_N12 = in_N2
+                in_N12[N1_S] = True
+                sum_d = int(np.count_nonzero(in_N12[self._neighbors_of(N2_S)]))
 
-            lie_value += inf_1 + (inf_1 / len(neighbors_in_S)) * self.p * sum_d
+            lie_value += inf_1 + (inf_1 / N1_S.size) * self.p * sum_d
 
         # Guardar el resultado en el caché antes de retornar
         self.lie_cache[S_set] = lie_value
@@ -313,6 +328,10 @@ class DCSA_BIM:
 
 def calcular_spread_monte_carlo(G, semillas, p=0.01, iteraciones=10000):
     """Ejecuta el modelo IC múltiples veces para calcular el spread esperado (promedio)"""
+    # Listas de adyacencia precalculadas (más rápido que G.neighbors, misma secuencia aleatoria)
+    adj = {v: list(G.neighbors(v)) for v in G.nodes()}
+    rand = random.random
+
     spread_total = 0
     for _ in range(iteraciones):
         nodos_activos = set(semillas)
@@ -321,9 +340,9 @@ def calcular_spread_monte_carlo(G, semillas, p=0.01, iteraciones=10000):
         while nuevos_activos:
             proximos_activos = set()
             for u in nuevos_activos:
-                for v in G.neighbors(u):
+                for v in adj[u]:
                     if v not in nodos_activos and v not in proximos_activos:
-                        if random.random() < p:
+                        if rand() < p:
                             proximos_activos.add(v)
             nuevos_activos = proximos_activos
             nodos_activos.update(proximos_activos)
@@ -378,17 +397,14 @@ if __name__ == "__main__":
     formato = input("Formato archivo (txt/csv): ")
     if formato == "txt":
         print("Cargando la red desde txt...")
-        ruta_red = "Redes/nombre_red.txt"
+        ruta_red = "Redes/facebook_combined.txt"
         G = nx.read_edgelist(ruta_red, comments='#', nodetype=int, create_using=nx.Graph())
     else:
         print("Cargando la red desde csv...")
-        ruta_red = "Redes/nombre_red.csv"
+        ruta_red = "Redes/musae_PTBR_edges.csv"
         df = pd.read_csv(ruta_red)
         G = nx.from_pandas_edgelist(df, source='nodo_1', target='nodo_2', create_using=nx.Graph())
 
-    largest_cc = max(nx.connected_components(G), key=len)
-    G = G.subgraph(largest_cc).copy()
-    G.remove_edges_from(nx.selfloop_edges(G))
     print(f"Red cargada: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
 
     # =====================================================================
@@ -440,7 +456,7 @@ if __name__ == "__main__":
         # --- DCSA-BIM ---
         # Pasar diccionarios precalculados a la clase
         dcsa_bim = DCSA_BIM(
-            G=G, n=20, B=50, alpha=alpha_costo, beta=beta_eficiencia, g_max=100, fl=1.5, AP=0.1,
+            G=G, n=30, B=50, alpha=alpha_costo, beta=beta_eficiencia, g_max=100, fl=2.0, AP=0.15,
             costs=costs_dict,
             efficiencies=efficiencies_dict,
             constraint_dict=constraint_dict,

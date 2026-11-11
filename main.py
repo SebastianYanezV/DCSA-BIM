@@ -119,22 +119,31 @@ class DCSA_BIM:
         return lie_value
 
     def generate_candidates(self, alpha_metric: float = 0.5, beta_cand: float = 3.0) -> List[int]:
-        """Genera candidatos usando K-shell y Structural Holes"""
+        """
+        Genera candidatos usando K-shell y Structural Holes. El índice NC de Li et al. (2021)
+        se divide por el costo del nodo y solo se consideran los nodos que caben en B
+        """
         k_shell = self._core if self._core is not None else nx.core_number(self.G)
         sum_ks = sum(k_shell.values())
         struct_holes = self._constraint
         sum_sh_inv = sum(1.0 / v if v > 0 else 0 for v in struct_holes.values())
 
+        # Solo nodos que caben en B (los que nunca podrían ser semilla no son candidatos
+        # ni inflan el costo promedio, como ocurre con los hubs en modelos de costo exponenciales)
+        factibles = [node for node in self.nodes if self.costs[node] <= self.B]
+        if not factibles:
+            return []
+
         NC = {}
-        for node in self.nodes:
+        for node in factibles:
             ks_term = k_shell[node] / sum_ks if sum_ks > 0 else 0
             sh_val = struct_holes[node]
             sh_term = (1.0 / sh_val) / sum_sh_inv if sh_val > 0 and sum_sh_inv > 0 else 0
-            NC[node] = alpha_metric * ks_term + (1 - alpha_metric) * sh_term
+            NC[node] = (alpha_metric * ks_term + (1 - alpha_metric) * sh_term) / self.costs[node]
 
         sorted_nodes = sorted(NC.keys(), key=lambda x: NC[x], reverse=True)
 
-        avg_cost = sum(self.costs.values()) / len(self.nodes)
+        avg_cost = sum(self.costs[node] for node in factibles) / len(factibles)
         k_est = max(1, int(self.B / avg_cost))
         top_beta_k = int(beta_cand * k_est)
 
@@ -401,9 +410,11 @@ if __name__ == "__main__":
         G = nx.read_edgelist(ruta_red, comments='#', nodetype=int, create_using=nx.Graph())
     else:
         print("Cargando la red desde csv...")
-        ruta_red = "Redes/musae_PTBR_edges.csv"
+        ruta_red = "Redes/artist_edges.csv"
         df = pd.read_csv(ruta_red)
         G = nx.from_pandas_edgelist(df, source='nodo_1', target='nodo_2', create_using=nx.Graph())
+
+    G.remove_edges_from(nx.selfloop_edges(G))
 
     print(f"Red cargada: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
 
@@ -456,7 +467,7 @@ if __name__ == "__main__":
         # --- DCSA-BIM ---
         # Pasar diccionarios precalculados a la clase
         dcsa_bim = DCSA_BIM(
-            G=G, n=30, B=50, alpha=alpha_costo, beta=beta_eficiencia, g_max=100, fl=2.0, AP=0.15,
+            G=G, n=20, B=50, alpha=alpha_costo, beta=beta_eficiencia, g_max=50, fl=1.5, AP=0.1,
             costs=costs_dict,
             efficiencies=efficiencies_dict,
             constraint_dict=constraint_dict,
